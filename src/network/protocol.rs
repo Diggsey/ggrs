@@ -21,6 +21,9 @@ use super::network_stats::NetworkStats;
 const NUM_SYNC_PACKETS: u32 = 5;
 const UDP_SHUTDOWN_TIMER: u64 = 5000;
 const PENDING_OUTPUT_SIZE: usize = 128;
+/// How many frames of a backlog (inputs a late joiner missed) are in flight, unacknowledged,
+/// at once.
+const BACKLOG_SEND_WINDOW: usize = 64;
 /// How often to re-send handshake packets while waiting for the remote to respond.
 /// Only active during the synchronization phase (typically < 1 second).
 const SYNC_RETRY_INTERVAL: Duration = Duration::from_millis(200);
@@ -185,9 +188,16 @@ where
 
     // input compression
     pending_output: VecDeque<InputBytes>,
+    /// Inputs to send after `pending_output`, held back to pace a long backlog by acks.
+    backlog: VecDeque<InputBytes>,
+    /// Whether every input goes through `backlog`: the peer joined late, and may take in our
+    /// inputs slower than we produce them while it catches up.
+    paced: bool,
     last_acked_input: InputBytes,
     max_prediction: usize,
     recv_inputs: HashMap<Frame, InputBytes>,
+    /// Inputs past this frame are not taken in (nor acknowledged) yet.
+    max_recv_frame: Frame,
 
     // time sync
     time_sync_layer: TimeSync,
@@ -233,11 +243,8 @@ impl<T: Config> UdpProtocol<T> {
         handles.sort_unstable();
         let recv_player_num = handles.len();
 
-        // peer connection status
-        let mut peer_connect_status = Vec::new();
-        for _ in 0..num_players {
-            peer_connect_status.push(ConnectionStatus::default());
-        }
+        // peer connection status, unknown until the peer reports it
+        let peer_connect_status = vec![ConnectionStatus::unknown(); num_players];
 
         // received input history
         let mut recv_inputs = HashMap::new();
@@ -272,9 +279,12 @@ impl<T: Config> UdpProtocol<T> {
 
             // input compression
             pending_output: VecDeque::with_capacity(PENDING_OUTPUT_SIZE),
+            backlog: VecDeque::new(),
+            paced: false,
             last_acked_input: InputBytes::zeroed::<T>(local_players),
             max_prediction,
             recv_inputs,
+            max_recv_frame: Frame::MAX,
 
             // time sync
             time_sync_layer: TimeSync::new(),
@@ -328,8 +338,48 @@ impl<T: Config> UdpProtocol<T> {
         &self.handles
     }
 
+    /// Inputs for frames after `frame` are left for the peer to send again later.
+    pub(crate) fn set_max_recv_frame(&mut self, frame: Frame) {
+        self.max_recv_frame = frame;
+    }
+
     pub(crate) fn pending_output_len(&self) -> usize {
         self.pending_output.len()
+    }
+
+    /// Whether the endpoint has never been sent any input.
+    pub(crate) fn has_sent_no_input(&self) -> bool {
+        self.pending_output.is_empty()
+            && self.backlog.is_empty()
+            && self.last_acked_input.frame == NULL_FRAME
+    }
+
+    /// Queues inputs the peer missed (a player joining late gets the inputs from the frame its
+    /// session starts at), to be sent ahead of any later input, a window at a time.
+    pub(crate) fn send_backlog(
+        &mut self,
+        inputs: impl IntoIterator<Item = InputBytes>,
+        connect_status: &[ConnectionStatus],
+    ) {
+        self.paced = true;
+        self.backlog.extend(inputs);
+        self.pump_backlog(connect_status);
+    }
+
+    /// Moves backlog into the inputs in flight as acknowledgements make room.
+    fn pump_backlog(&mut self, connect_status: &[ConnectionStatus]) {
+        if self.state != ProtocolState::Running || self.backlog.is_empty() {
+            return;
+        }
+        while self.pending_output.len() < BACKLOG_SEND_WINDOW {
+            let Some(input) = self.backlog.pop_front() else {
+                break;
+            };
+            self.pending_output.push_back(input);
+        }
+        // The peer sends no input to answer while it catches up, so resend what is in flight
+        // with every frame, as with ordinary input.
+        self.send_pending_output(connect_status);
     }
 
     pub(crate) fn is_synchronized(&self) -> bool {
@@ -386,6 +436,8 @@ impl<T: Config> UdpProtocol<T> {
                 }
             }
             ProtocolState::Running => {
+                self.pump_backlog(connect_status);
+
                 // resend pending inputs, if some time has passed without sending or receiving inputs
                 if self.running_last_input_recv + RUNNING_RETRY_INTERVAL < now {
                     self.send_pending_output(connect_status);
@@ -505,6 +557,13 @@ impl<T: Config> UdpProtocol<T> {
             self.local_frame_advantage,
             self.remote_frame_advantage,
         );
+
+        // inputs go after any backlog the peer has yet to receive
+        if self.paced {
+            self.backlog.push_back(endpoint_data);
+            self.pump_backlog(connect_status);
+            return;
+        }
 
         self.pending_output.push_back(endpoint_data);
 
@@ -713,13 +772,12 @@ impl<T: Config> UdpProtocol<T> {
             }
         } else {
             // update the peer connection status
-            for i in 0..self.peer_connect_status.len() {
-                self.peer_connect_status[i].disconnected = body.peer_connect_status[i].disconnected
-                    || self.peer_connect_status[i].disconnected;
-                self.peer_connect_status[i].last_frame = std::cmp::max(
-                    self.peer_connect_status[i].last_frame,
-                    body.peer_connect_status[i].last_frame,
-                );
+            for (mine, theirs) in self
+                .peer_connect_status
+                .iter_mut()
+                .zip(&body.peer_connect_status)
+            {
+                mine.merge(theirs);
             }
         }
 
@@ -730,6 +788,14 @@ impl<T: Config> UdpProtocol<T> {
         } else {
             body.start_frame - 1
         };
+
+        // The inputs are encoded against one the peer last knew we had. If we dropped that one
+        // since (the peer missed our acks), tell the peer again what we have, so that it
+        // encodes against that instead. A peer that sends no input of its own (one catching up
+        // after joining late) acknowledges only this way.
+        if self.last_recv_frame() != NULL_FRAME && !self.recv_inputs.contains_key(&decode_frame) {
+            self.send_input_ack();
+        }
 
         // if we have the necessary input saved, we decode
         if let Some(decode_inp) = self.recv_inputs.get(&decode_frame) {
@@ -748,6 +814,10 @@ impl<T: Config> UdpProtocol<T> {
                 // skip inputs that we don't need
                 if inp_frame <= self.last_recv_frame() {
                     continue;
+                }
+                // and leave those we have no room for yet
+                if inp_frame > self.max_recv_frame {
+                    break;
                 }
 
                 let input_data = InputBytes {
