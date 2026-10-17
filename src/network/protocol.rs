@@ -196,6 +196,9 @@ where
     last_acked_input: InputBytes,
     max_prediction: usize,
     recv_inputs: HashMap<Frame, InputBytes>,
+    /// The first frame of input received: until the peer hears our acknowledgement, it keeps
+    /// sending from there, encoded against the blank input.
+    first_recv_frame: Frame,
     /// Inputs past this frame are not taken in (nor acknowledged) yet.
     max_recv_frame: Frame,
 
@@ -284,6 +287,7 @@ impl<T: Config> UdpProtocol<T> {
             last_acked_input: InputBytes::zeroed::<T>(local_players),
             max_prediction,
             recv_inputs,
+            first_recv_frame: NULL_FRAME,
             max_recv_frame: Frame::MAX,
 
             // time sync
@@ -781,13 +785,15 @@ impl<T: Config> UdpProtocol<T> {
             }
         }
 
-        // if we did not receive any input yet, we decode with the blank input,
-        // otherwise we use the input previous to the start of the encoded inputs
-        let decode_frame = if self.last_recv_frame() == NULL_FRAME {
-            NULL_FRAME
-        } else {
-            body.start_frame - 1
-        };
+        // If we did not receive any input yet, or the peer still sends from its first input
+        // (it has not heard our acknowledgement), the inputs are encoded against the blank input;
+        // otherwise against the input previous to the start of the encoded inputs.
+        let decode_frame =
+            if self.last_recv_frame() == NULL_FRAME || body.start_frame == self.first_recv_frame {
+                NULL_FRAME
+            } else {
+                body.start_frame - 1
+            };
 
         // The inputs are encoded against one the peer last knew we had. If we dropped that one
         // since (the peer missed our acks), tell the peer again what we have, so that it
@@ -820,6 +826,9 @@ impl<T: Config> UdpProtocol<T> {
                     break;
                 }
 
+                if self.first_recv_frame == NULL_FRAME {
+                    self.first_recv_frame = inp_frame;
+                }
                 let input_data = InputBytes {
                     frame: inp_frame,
                     bytes: inp,
@@ -845,10 +854,12 @@ impl<T: Config> UdpProtocol<T> {
             // send an input ack
             self.send_input_ack();
 
-            // delete received inputs that are too old
+            // Delete received inputs that are too old. The peer encodes against the last one it
+            // knows we have, which is a round trip old: keep as many as it may have in flight.
             let last_recv_frame = self.last_recv_frame();
+            let keep = std::cmp::max(2 * self.max_prediction, PENDING_OUTPUT_SIZE) as i32;
             self.recv_inputs
-                .retain(|&k, _| k >= last_recv_frame - 2 * self.max_prediction as i32);
+                .retain(|&k, _| k == NULL_FRAME || k >= last_recv_frame - keep);
         }
     }
 
@@ -1028,6 +1039,28 @@ mod protocol_tests {
 
         assert_eq!(protocol.last_recv_frame(), 2);
         assert!(!protocol.event_queue.is_empty());
+    }
+
+    #[test]
+    fn resent_first_inputs_decode_against_the_blank_input() {
+        // A peer that has not heard our acknowledgement yet resends its inputs from its first
+        // one, encoded against the blank input, with more inputs each time.
+        let mut protocol = running_protocol(vec![0], 1);
+        let blank = protocol.recv_inputs[&NULL_FRAME].bytes.clone();
+        let inputs: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| bincode::serialize(&TestInput { inp: 10 + i }).unwrap())
+            .collect();
+        for n in 1..=3 {
+            let msg = input_message(Input {
+                peer_connect_status: vec![ConnectionStatus::default(); 1],
+                disconnect_requested: false,
+                start_frame: 500,
+                ack_frame: NULL_FRAME,
+                bytes: encode(&blank, inputs[..n].iter()),
+            });
+            protocol.handle_message(&msg);
+            assert_eq!(protocol.last_recv_frame(), 499 + n as Frame);
+        }
     }
 
     #[test]
