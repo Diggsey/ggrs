@@ -20,8 +20,12 @@ or reloads its state: the joiner alone loads a state, and every other peer goes 
    window of 64 unacknowledged frames at a time. The joiner catches up by simulating those
    frames as fast as it can (`frames_behind` says how far behind it is). Nobody waits for it:
    its slot is still open.
-4. **The sponsor activates the slot** with `activate_player(slot)`, once the joiner has caught up.
-   This returns the activation frame `F`: the first frame the sponsor has not yet sent input for.
+4. **The sponsor activates the slot** with `activate_player(slot)`, once the joiner has caught up
+   (the joiner can tell from `frames_behind`, and tell the sponsor by whatever means the game
+   uses). This returns the activation frame `F`: the first frame the sponsor has not yet sent
+   input for. Until the sponsor's connection to the joiner has synchronized, it returns
+   `GgrsError::NotSynchronized`. `activate_player_at` takes a later frame: half the round trip
+   to the joiner later, the joiner learns of the frame before it gets there.
    From `F` on, the slot is played; before it, it is open.
 5. **Every peer learns `F` in band.** The activation frame travels in the connection status
    every input message carries, and peers pass it on. A peer cannot confirm frame `F` without the

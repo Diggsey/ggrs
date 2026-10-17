@@ -308,6 +308,12 @@ impl<T: Config> UdpProtocol<T> {
         }
     }
 
+    /// How many frames old what the peer last told us is, by now: half the round trip.
+    pub(crate) fn one_way_frames(&self) -> Frame {
+        let ping = i32::try_from(self.round_trip_time / 2).unwrap_or(i32::MAX);
+        ping.saturating_mul(self.fps as i32) / 1000
+    }
+
     pub(crate) fn update_local_frame_advantage(&mut self, local_frame: Frame) {
         if local_frame == NULL_FRAME || self.last_recv_frame() == NULL_FRAME {
             return;

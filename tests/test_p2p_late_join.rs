@@ -259,7 +259,7 @@ impl Net {
         for p in &mut self.peers {
             p.step();
             let mut extra = 0;
-            while p.session.frames_behind() > 2 && extra < 30 {
+            while p.session.frames_behind().is_some_and(|b| b > 2) && extra < 30 {
                 p.step();
                 extra += 1;
             }
@@ -305,11 +305,16 @@ impl Net {
 
     /// Runs until the joiner has caught up, then has peer 0 activate it.
     fn activate(&mut self, addr: u16, slot: PlayerHandle) -> Frame {
+        self.activate_after(addr, slot, 0)
+    }
+
+    /// As `activate`, at least `margin` frames after peer 0's current frame.
+    fn activate_after(&mut self, addr: u16, slot: PlayerHandle, margin: Frame) -> Frame {
         for _ in 0..3000 {
             self.tick();
             let j = self.peer(addr);
             if j.session.current_state() == SessionState::Running
-                && j.session.frames_behind() <= 4
+                && j.session.frames_behind().is_some_and(|b| b <= 4)
                 && j.session.confirmed_frame() >= j.session.current_frame() - 1
             {
                 break;
@@ -317,9 +322,13 @@ impl Net {
         }
         let j = self.peer(addr);
         assert_eq!(j.session.current_state(), SessionState::Running);
-        assert!(j.session.frames_behind() <= 4, "the joiner caught up");
+        assert!(
+            j.session.frames_behind().is_some_and(|b| b <= 4),
+            "the joiner caught up"
+        );
         for _ in 0..200 {
-            match self.peers[0].session.activate_player(slot) {
+            let at = self.peers[0].session.current_frame() + margin;
+            match self.peers[0].session.activate_player_at(slot, at) {
                 Ok(frame) => return frame,
                 Err(GgrsError::NotSynchronized) => self.tick(),
                 Err(e) => panic!("{e}"),
@@ -377,7 +386,7 @@ fn late_join(delay: u64, loss: f64) {
     let start = net.join(10, 2, &[0, 1]);
     assert!(start > 60);
     let stalls_before: Vec<u32> = net.peers[..2].iter().map(|p| p.stalls).collect();
-    let frame = net.activate(10, 2);
+    let frame = net.activate_after(10, 2, delay as Frame + 2);
     net.run(300);
 
     let compared = net.check_agree();
@@ -493,6 +502,11 @@ fn test_activation_errors() -> Result<(), GgrsError> {
     // a player added but not active plays no frame
     s.add_remote_player(2, 10, 20)?;
     assert_eq!(s.player_active_from(2), None);
+    // nor can they be activated before we can exchange input with them
+    assert!(matches!(
+        s.activate_player(2),
+        Err(GgrsError::NotSynchronized)
+    ));
     // dropping them frees the slot
     s.disconnect_player(2)?;
     s.add_remote_player(2, 11, 20)?;

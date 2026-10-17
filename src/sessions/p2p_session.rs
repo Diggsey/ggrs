@@ -682,13 +682,31 @@ impl<T: Config> P2PSession<T> {
     /// # Errors
     /// - Returns [`InvalidRequest`] if the slot has no player, is already active, or this peer
     ///   has no active local player.
-    /// - Returns [`NotSynchronized`] if the slot's previous player left too recently: try again
-    ///   in a few frames.
+    /// - Returns [`NotSynchronized`] if this peer's connection to the player has not finished
+    ///   synchronizing, or the slot's previous player left too recently: try again in a few
+    ///   frames.
     ///
     /// [`add_remote_player`]: Self::add_remote_player
     /// [`InvalidRequest`]: GgrsError::InvalidRequest
     /// [`NotSynchronized`]: GgrsError::NotSynchronized
     pub fn activate_player(&mut self, player_handle: PlayerHandle) -> Result<Frame, GgrsError> {
+        self.activate_player_at(player_handle, 0)
+    }
+
+    /// Like [`activate_player`], at frame `not_before` or the earliest frame
+    /// [`activate_player`] would choose, whichever is later. A later frame gives the joining
+    /// peer time to learn of it before reaching it, so that its first input is not late: half
+    /// the round trip to it is enough.
+    ///
+    /// # Errors
+    /// As for [`activate_player`].
+    ///
+    /// [`activate_player`]: Self::activate_player
+    pub fn activate_player_at(
+        &mut self,
+        player_handle: PlayerHandle,
+        not_before: Frame,
+    ) -> Result<Frame, GgrsError> {
         if player_handle >= self.num_players {
             return Err(GgrsError::InvalidRequest {
                 info: "The handle is not a player slot.".to_owned(),
@@ -721,9 +739,20 @@ impl<T: Config> P2PSession<T> {
             .ok_or_else(|| GgrsError::InvalidRequest {
                 info: "Activating a player needs an active local player.".to_owned(),
             })?;
-        let frame = std::cmp::max(frame, self.sync_layer.current_frame());
+        let frame = frame.max(self.sync_layer.current_frame()).max(not_before);
         if status.active_from != NULL_FRAME && !self.previous_player_settled(player_handle) {
             return Err(GgrsError::NotSynchronized);
+        }
+        // a player we cannot exchange input with yet would only make everyone wait
+        if let Some(PlayerType::Remote(addr)) = self.player_reg.handles.get(&player_handle) {
+            if !self
+                .player_reg
+                .remotes
+                .get(addr)
+                .is_some_and(|e| e.is_running())
+            {
+                return Err(GgrsError::NotSynchronized);
+            }
         }
 
         self.start_player(player_handle, ConnectionStatus::active_from(frame), frame);
@@ -743,19 +772,25 @@ impl<T: Config> P2PSession<T> {
     }
 
     /// While no local player is active (a peer that joined late and waits for its slot to be
-    /// activated), how many frames the furthest peer is ahead of this session, from the
-    /// progress peers report of their own players. Advance frames quickly while it is above 0
-    /// or so to catch up (the session runs on confirmed input, so it does not run ahead of its
-    /// inputs), and have the slot activated once it is small. 0 once a local player plays, as
-    /// the usual time synchronization takes over.
-    pub fn frames_behind(&self) -> usize {
+    /// activated), how many frames the furthest peer is ahead of this session: the progress
+    /// peers report of their own players, plus how far they have got since (half the round
+    /// trip). Advance frames quickly while it is above 0 or so to catch up, and have the slot
+    /// activated once it is small.
+    ///
+    /// `None` while the session is not running, or some player's peer has not reported its
+    /// progress yet: how far behind the session is cannot be told. `Some(0)` once a local
+    /// player plays, as the usual time synchronization takes over.
+    pub fn frames_behind(&self) -> Option<usize> {
         let local_active = self
             .player_reg
             .local_player_handles()
             .into_iter()
             .any(|h| !self.local_connect_status[h].disconnected);
-        if local_active || self.state != SessionState::Running {
-            return 0;
+        if self.state != SessionState::Running {
+            return None;
+        }
+        if local_active {
+            return Some(0);
         }
         // a peer's last input for its own player is its frame plus its input delay
         let ours = self.sync_layer.current_frame() + self.input_delay as Frame - 1;
@@ -769,12 +804,13 @@ impl<T: Config> P2PSession<T> {
                     continue;
                 }
                 let theirs = endpoint.peer_connect_status(h);
-                if theirs.active_from == status.active_from {
-                    ahead = ahead.max(theirs.last_frame - ours);
+                if theirs.active_from != status.active_from {
+                    return None;
                 }
+                ahead = ahead.max(theirs.last_frame + endpoint.one_way_frames() - ours);
             }
         }
-        ahead.max(0) as usize
+        Some(ahead.max(0) as usize)
     }
 
     /// Fails unless `handle` is a player slot nobody plays.
@@ -1354,9 +1390,14 @@ impl<T: Config> P2PSession<T> {
             return;
         }
 
-        // if any endpoint is not synchronized, we continue synchronizing
+        // if any endpoint is not synchronized, we continue synchronizing; players who do not
+        // play (yet), added while they join, need not be waited for
         for endpoint in self.player_reg.remotes.values_mut() {
-            if !endpoint.is_synchronized() {
+            let plays = endpoint
+                .handles()
+                .iter()
+                .any(|&h| !self.local_connect_status[h].disconnected);
+            if plays && !endpoint.is_synchronized() {
                 return;
             }
         }
